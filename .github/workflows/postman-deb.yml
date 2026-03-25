@@ -262,6 +262,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -279,6 +282,7 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "v${{ needs.detect-version.outputs.version }}" \
+            --repo "${{ github.repository }}" \
             --title "Postman v${{ needs.detect-version.outputs.version }}" \
             --notes "Automated Postman Debian packages built for Ubuntu and Debian environments."
 
@@ -288,4 +292,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          find dist -type f -name "*.deb" -exec gh release upload "v${{ needs.detect-version.outputs.version }}" {} --clobber \;
+          find dist -type f -name "*.deb" -exec gh release upload "v${{ needs.detect-version.outputs.version }}" {} --repo "${{ github.repository }}" --clobber \;
