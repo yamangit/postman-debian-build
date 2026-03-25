@@ -3,7 +3,7 @@ name: Package latest Postman as .deb
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 3 * * *"   # daily at 03:17 UTC
+    - cron: "17 3 * * *"
 
 permissions:
   contents: write
@@ -19,32 +19,44 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq dpkg-dev fakeroot xz-utils curl
+          sudo apt-get install -y \
+            curl \
+            wget \
+            fakeroot \
+            dpkg-dev \
+            desktop-file-utils
 
       - name: Get latest Postman version
         id: postman
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Follow Postman's latest Linux x64 download endpoint
-          FINAL_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://dl.pstmn.io/download/latest/linux64)"
-          echo "final_url=$FINAL_URL" >> "$GITHUB_OUTPUT"
+          DOWNLOAD_URL="https://dl.pstmn.io/download/latest/linux64"
 
-          # Try to extract version from redirected URL
-          VERSION="$(echo "$FINAL_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+          DATE_HDR="$(curl -sI "$DOWNLOAD_URL" | awk 'BEGIN{IGNORECASE=1} /^date:/{sub(/^date:[[:space:]]*/,""); print; exit}')"
 
-          if [ -z "$VERSION" ]; then
-            echo "Could not detect Postman version from URL"
+          if [ -z "$DATE_HDR" ]; then
+            echo "Could not read Date header from $DOWNLOAD_URL"
             exit 1
           fi
 
+          TARGET_NAME="postman-$(date --date="$DATE_HDR" "+%y-%j-%H").tar.gz"
+          VERSION_MAJ="$(echo "$TARGET_NAME" | awk -F '.' '{ print $1 }' | awk -F '-' '{ print $2 }')"
+          VERSION_MIN="$(echo "$TARGET_NAME" | awk -F '.' '{ print $1 }' | awk -F '-' '{ print $3 }')"
+          VERSION_REV="$(echo "$TARGET_NAME" | awk -F '.' '{ print $1 }' | awk -F '-' '{ print $4 }')"
+          VERSION="${VERSION_MAJ}.${VERSION_MIN}-${VERSION_REV}"
+
+          echo "date_header=$DATE_HDR" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
           echo "Detected version: $VERSION"
 
       - name: Check if release already exists
         id: check_release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           set +e
           gh release view "v${{ steps.postman.outputs.version }}" >/dev/null 2>&1
@@ -54,80 +66,107 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Stop if version already packaged
+      - name: Stop if already released
         if: steps.check_release.outputs.exists == 'true'
         run: |
-          echo "Release v${{ steps.postman.outputs.version }} already exists. Nothing to do."
+          echo "Release v${{ steps.postman.outputs.version }} already exists."
           exit 0
 
       - name: Download latest Postman
+        shell: bash
         run: |
+          set -euo pipefail
           curl -fL "https://dl.pstmn.io/download/latest/linux64" -o postman.tar.gz
           tar -xzf postman.tar.gz
+          test -d Postman
 
-      - name: Build .deb structure
+      - name: Build .deb package
+        id: build_deb
+        shell: bash
         run: |
           set -euo pipefail
 
-          APP_NAME=postman
           VERSION="${{ steps.postman.outputs.version }}"
-          PKG_DIR="${APP_NAME}_${VERSION}_amd64"
+          PKG_ROOT="pkgroot"
+          PKG_NAME="postman_${VERSION}_amd64.deb"
+          STAGE_DIR="${PKG_ROOT}/postman_${VERSION}_amd64"
 
-          mkdir -p "${PKG_DIR}/DEBIAN"
-          mkdir -p "${PKG_DIR}/opt"
-          mkdir -p "${PKG_DIR}/usr/share/applications"
-          mkdir -p "${PKG_DIR}/usr/share/pixmaps"
-          mkdir -p "${PKG_DIR}/usr/bin"
+          rm -rf "$PKG_ROOT"
+          mkdir -p "${STAGE_DIR}/DEBIAN"
+          mkdir -p "${STAGE_DIR}/opt"
+          mkdir -p "${STAGE_DIR}/usr/bin"
+          mkdir -p "${STAGE_DIR}/usr/share/applications"
+          mkdir -p "${STAGE_DIR}/usr/share/icons/hicolor/256x256/apps"
 
-          mv Postman "${PKG_DIR}/opt/Postman"
+          mv Postman "${STAGE_DIR}/opt/Postman"
 
-          cat > "${PKG_DIR}/DEBIAN/control" <<EOF
+          cat > "${STAGE_DIR}/DEBIAN/control" <<EOF
           Package: postman
           Version: ${VERSION}
-          Section: utils
+          Section: devel
           Priority: optional
           Architecture: amd64
           Maintainer: GitHub Actions <actions@github.com>
           Depends: libgtk-3-0, libnss3, libxss1, libasound2
-          Description: Postman API platform desktop app repackaged as a Debian package
+          Description: Postman desktop app repackaged as a Debian package
+           Postman is an API platform for building and using APIs.
           EOF
 
-          cat > "${PKG_DIR}/usr/share/applications/postman.desktop" <<EOF
+          cat > "${STAGE_DIR}/usr/share/applications/postman.desktop" <<EOF
           [Desktop Entry]
           Version=1.0
           Type=Application
           Name=Postman
+          Comment=API Development Environment
           Exec=/opt/Postman/Postman
           Icon=postman
-          Categories=Development;Utility;
           Terminal=false
+          Categories=Development;Utility;
+          StartupNotify=true
           EOF
 
-          ln -s /opt/Postman/Postman "${PKG_DIR}/usr/bin/postman"
+          ln -sf /opt/Postman/Postman "${STAGE_DIR}/usr/bin/postman"
 
-          if [ -f "${PKG_DIR}/opt/Postman/app/resources/app/assets/icon.png" ]; then
-            cp "${PKG_DIR}/opt/Postman/app/resources/app/assets/icon.png" "${PKG_DIR}/usr/share/pixmaps/postman.png"
-          elif [ -f "${PKG_DIR}/opt/Postman/resources/app/assets/icon.png" ]; then
-            cp "${PKG_DIR}/opt/Postman/resources/app/assets/icon.png" "${PKG_DIR}/usr/share/pixmaps/postman.png"
-          else
-            # no icon found; not fatal
-            touch "${PKG_DIR}/usr/share/pixmaps/postman.png"
+          ICON_CANDIDATES=(
+            "${STAGE_DIR}/opt/Postman/app/icons/icon_256x256.png"
+            "${STAGE_DIR}/opt/Postman/app/resources/app/assets/icon.png"
+            "${STAGE_DIR}/opt/Postman/resources/app/assets/icon.png"
+            "${STAGE_DIR}/opt/Postman/usr/share/icons/hicolor/256x256/apps/postman.png"
+          )
+
+          ICON_FOUND=""
+          for icon in "${ICON_CANDIDATES[@]}"; do
+            if [ -f "$icon" ]; then
+              ICON_FOUND="$icon"
+              break
+            fi
+          done
+
+          if [ -n "$ICON_FOUND" ]; then
+            cp "$ICON_FOUND" "${STAGE_DIR}/usr/share/icons/hicolor/256x256/apps/postman.png"
           fi
 
-          fakeroot dpkg-deb --build "${PKG_DIR}"
+          fakeroot dpkg-deb --build "${STAGE_DIR}" "${PKG_NAME}"
+
+          echo "deb_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Built package: ${PKG_NAME}"
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
           gh release create "v${{ steps.postman.outputs.version }}" \
             --title "Postman v${{ steps.postman.outputs.version }}" \
-            --notes "Automated Debian repackaging of the latest Postman Linux release."
+            --notes "Automated Debian package build for Postman."
 
-      - name: Upload .deb to release
+      - name: Upload .deb asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
           gh release upload "v${{ steps.postman.outputs.version }}" \
-            "postman_${{ steps.postman.outputs.version }}_amd64.deb" \
+            "${{ steps.build_deb.outputs.deb_name }}" \
             --clobber
