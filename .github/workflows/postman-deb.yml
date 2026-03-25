@@ -9,23 +9,12 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
+  detect-version:
     runs-on: ubuntu-latest
-
+    outputs:
+      version: ${{ steps.postman.outputs.version }}
+      exists: ${{ steps.check_release.outputs.exists }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            curl \
-            wget \
-            fakeroot \
-            dpkg-dev \
-            desktop-file-utils
-
       - name: Get latest Postman version
         id: postman
         shell: bash
@@ -47,9 +36,7 @@ jobs:
           VERSION_REV="$(echo "$TARGET_NAME" | awk -F '.' '{ print $1 }' | awk -F '-' '{ print $4 }')"
           VERSION="${VERSION_MAJ}.${VERSION_MIN}-${VERSION_REV}"
 
-          echo "date_header=$DATE_HDR" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
           echo "Detected version: $VERSION"
 
       - name: Check if release already exists
@@ -66,11 +53,27 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Stop if already released
-        if: steps.check_release.outputs.exists == 'true'
+  build-ubuntu:
+    needs: detect-version
+    if: needs.detect-version.outputs.exists != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        shell: bash
         run: |
-          echo "Release v${{ steps.postman.outputs.version }} already exists."
-          exit 0
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            wget \
+            fakeroot \
+            dpkg-dev \
+            desktop-file-utils \
+            ca-certificates
 
       - name: Download latest Postman
         shell: bash
@@ -80,18 +83,18 @@ jobs:
           tar -xzf postman.tar.gz
           test -d Postman
 
-      - name: Build .deb package
+      - name: Build Ubuntu .deb
         id: build_deb
         shell: bash
         run: |
           set -euo pipefail
 
-          VERSION="${{ steps.postman.outputs.version }}"
-          PKG_ROOT="pkgroot"
-          PKG_NAME="postman_${VERSION}_amd64.deb"
-          STAGE_DIR="${PKG_ROOT}/postman_${VERSION}_amd64"
+          VERSION="${{ needs.detect-version.outputs.version }}"
+          PKG_NAME="postman_${VERSION}_amd64_ubuntu.deb"
+          BUILD_DIR="build"
+          STAGE_DIR="${BUILD_DIR}/postman_${VERSION}_amd64"
 
-          rm -rf "$PKG_ROOT"
+          rm -rf "$BUILD_DIR"
           mkdir -p "${STAGE_DIR}/DEBIAN"
           mkdir -p "${STAGE_DIR}/opt"
           mkdir -p "${STAGE_DIR}/usr/bin"
@@ -134,22 +137,140 @@ jobs:
             "${STAGE_DIR}/opt/Postman/usr/share/icons/hicolor/256x256/apps/postman.png"
           )
 
-          ICON_FOUND=""
           for icon in "${ICON_CANDIDATES[@]}"; do
             if [ -f "$icon" ]; then
-              ICON_FOUND="$icon"
+              cp "$icon" "${STAGE_DIR}/usr/share/icons/hicolor/256x256/apps/postman.png"
               break
             fi
           done
 
-          if [ -n "$ICON_FOUND" ]; then
-            cp "$ICON_FOUND" "${STAGE_DIR}/usr/share/icons/hicolor/256x256/apps/postman.png"
-          fi
+          fakeroot dpkg-deb --build "${STAGE_DIR}" "${PKG_NAME}"
+          echo "deb_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Ubuntu artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-deb
+          path: ${{ steps.build_deb.outputs.deb_name }}
+
+  build-debian:
+    needs: detect-version
+    if: needs.detect-version.outputs.exists != 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y \
+            git \
+            curl \
+            wget \
+            fakeroot \
+            dpkg-dev \
+            desktop-file-utils \
+            ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download latest Postman
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL "https://dl.pstmn.io/download/latest/linux64" -o postman.tar.gz
+          tar -xzf postman.tar.gz
+          test -d Postman
+
+      - name: Build Debian .deb
+        id: build_deb
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ needs.detect-version.outputs.version }}"
+          PKG_NAME="postman_${VERSION}_amd64_debian.deb"
+          BUILD_DIR="build"
+          STAGE_DIR="${BUILD_DIR}/postman_${VERSION}_amd64"
+
+          rm -rf "$BUILD_DIR"
+          mkdir -p "${STAGE_DIR}/DEBIAN"
+          mkdir -p "${STAGE_DIR}/opt"
+          mkdir -p "${STAGE_DIR}/usr/bin"
+          mkdir -p "${STAGE_DIR}/usr/share/applications"
+          mkdir -p "${STAGE_DIR}/usr/share/icons/hicolor/256x256/apps"
+
+          mv Postman "${STAGE_DIR}/opt/Postman"
+
+          cat > "${STAGE_DIR}/DEBIAN/control" <<EOF
+          Package: postman
+          Version: ${VERSION}
+          Section: devel
+          Priority: optional
+          Architecture: amd64
+          Maintainer: GitHub Actions <actions@github.com>
+          Depends: libgtk-3-0, libnss3, libxss1, libasound2
+          Description: Postman desktop app repackaged as a Debian package
+           Postman is an API platform for building and using APIs.
+          EOF
+
+          cat > "${STAGE_DIR}/usr/share/applications/postman.desktop" <<EOF
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Postman
+          Comment=API Development Environment
+          Exec=/opt/Postman/Postman
+          Icon=postman
+          Terminal=false
+          Categories=Development;Utility;
+          StartupNotify=true
+          EOF
+
+          ln -sf /opt/Postman/Postman "${STAGE_DIR}/usr/bin/postman"
+
+          ICON_CANDIDATES=(
+            "${STAGE_DIR}/opt/Postman/app/icons/icon_256x256.png"
+            "${STAGE_DIR}/opt/Postman/app/resources/app/assets/icon.png"
+            "${STAGE_DIR}/opt/Postman/resources/app/assets/icon.png"
+            "${STAGE_DIR}/opt/Postman/usr/share/icons/hicolor/256x256/apps/postman.png"
+          )
+
+          for icon in "${ICON_CANDIDATES[@]}"; do
+            if [ -f "$icon" ]; then
+              cp "$icon" "${STAGE_DIR}/usr/share/icons/hicolor/256x256/apps/postman.png"
+              break
+            fi
+          done
 
           fakeroot dpkg-deb --build "${STAGE_DIR}" "${PKG_NAME}"
-
           echo "deb_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
-          echo "Built package: ${PKG_NAME}"
+
+      - name: Upload Debian artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-deb
+          path: ${{ steps.build_deb.outputs.deb_name }}
+
+  release:
+    needs: [detect-version, build-ubuntu, build-debian]
+    if: needs.detect-version.outputs.exists != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Show downloaded files
+        shell: bash
+        run: |
+          find dist -type f -name "*.deb" -print
 
       - name: Create GitHub release
         env:
@@ -157,16 +278,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release create "v${{ steps.postman.outputs.version }}" \
-            --title "Postman v${{ steps.postman.outputs.version }}" \
-            --notes "Automated Debian package build for Postman."
+          gh release create "v${{ needs.detect-version.outputs.version }}" \
+            --title "Postman v${{ needs.detect-version.outputs.version }}" \
+            --notes "Automated Postman Debian packages built for Ubuntu and Debian environments."
 
-      - name: Upload .deb asset
+      - name: Upload both .deb packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "v${{ steps.postman.outputs.version }}" \
-            "${{ steps.build_deb.outputs.deb_name }}" \
-            --clobber
+          find dist -type f -name "*.deb" -exec gh release upload "v${{ needs.detect-version.outputs.version }}" {} --clobber \;
