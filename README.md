@@ -1,4 +1,4 @@
-# Postman Debian Builder
+# Postman Debian/Ubuntu Builder
 
 This repository automatically:
 
@@ -13,4 +13,5 @@ This repository automatically:
 
 ## Output
 
-- postman_<version>_amd64.deb
+- postman_<version>_amd64_debian.deb
+- postman_<version>_amd64_ubuntu.deb
